@@ -10,29 +10,65 @@ from torch.nn import functional as F
 import sklearn.metrics 
 import copy
 
+class DynamicThreshold:
+    def __init__(self, alpha=0.5, beta=3, decay_rate=0.9):
+        """
+        Initialize dynamic threshold parameters.
+        Args:
+            alpha (float): Initial confidence threshold.
+            beta (int): Initial number of iterations for instance selection.
+            decay_rate (float): Decay factor for thresholds.
+        """
+        self.alpha = alpha
+        self.beta = beta
+        self.decay_rate = decay_rate
+        self.confidence_history = []
+
+    def adjust_thresholds(self, avg_confidence, low_threshold=0.4, high_threshold=0.7, step=1):
+        """
+        Adjust alpha and beta based on average confidence.
+        """
+        if avg_confidence < low_threshold:
+            self.beta += step  # Increase exploration
+        elif avg_confidence > high_threshold:
+            self.beta = max(self.beta - step, 1)  # Reduce unnecessary iterations
+        self.alpha = avg_confidence  # Update alpha to match current confidence
+
+    def decay_thresholds(self):
+        """
+        Apply decay to thresholds.
+        """
+        self.alpha *= self.decay_rate
+        self.beta = max(1, int(self.beta * self.decay_rate))
+
+    def check_early_stopping(self, window_size=5, variance_threshold=0.001):
+        """
+        Check if confidence scores have stabilized for early stopping.
+        """
+        if len(self.confidence_history) < window_size:
+            return False
+        recent_scores = self.confidence_history[-window_size:]
+        return np.var(recent_scores) < variance_threshold
+    
 class Siamese(nn.Module):
 
     def __init__(self, sentence_encoder, hidden_size=230, drop_rate=0.5, pre_rep=None, euc=True):
         nn.Module.__init__(self)
-        self.sentence_encoder = sentence_encoder # Should be different from main sentence encoder
+        self.sentence_encoder = sentence_encoder  # Should be different from the main sentence encoder
         self.hidden_size = hidden_size
-        # self.fc1 = nn.Linear(hidden_size * 2, hidden_size * 2)
-        # self.fc2 = nn.Linear(hidden_size * 2, 1)
         self.fc = nn.Linear(hidden_size, 1)
         self.cost = nn.BCELoss(reduction="none")
         self.drop = nn.Dropout(drop_rate)
         self._accuracy = 0.0
         self.pre_rep = pre_rep
-        self.euc = euc
+        self.euc = euc  # Use Euclidean if True, otherwise use Cosine Similarity
 
     def forward(self, data, num_size, num_class, threshold=0.5):
         x = self.sentence_encoder(data).contiguous().view(num_class, num_size, -1)
-        x1 = x[:, :num_size//2].contiguous().view(-1, self.hidden_size)
-        x2 = x[:, num_size//2:].contiguous().view(-1, self.hidden_size)
-        y1 = x[:num_class//2,:].contiguous().view(-1, self.hidden_size)
-        y2 = x[num_class//2:,:].contiguous().view(-1, self.hidden_size)
-        # y1 = x[0].contiguous().unsqueeze(0).expand(x.size(0) - 1, -1, -1).contiguous().view(-1, self.hidden_size)
-        # y2 = x[1:].contiguous().view(-1, self.hidden_size)
+        x1 = x[:, :num_size // 2].contiguous().view(-1, self.hidden_size)
+        x2 = x[:, num_size // 2:].contiguous().view(-1, self.hidden_size)
+        y1 = x[:num_class // 2, :].contiguous().view(-1, self.hidden_size)
+        y2 = x[num_class // 2:, :].contiguous().view(-1, self.hidden_size)
 
         label = torch.zeros((x1.size(0) + y1.size(0))).long().cuda()
         label[:x1.size(0)] = 1
@@ -41,16 +77,12 @@ class Siamese(nn.Module):
 
         if self.euc:
             dis = torch.pow(z1 - z2, 2)
-            dis = self.drop(dis)
-            score = torch.sigmoid(self.fc(dis).squeeze())
         else:
-            z = z1 * z2
-            z = self.drop(z)
-            z = self.fc(z).squeeze()
-            # z = torch.cat([z1, z2], -1)
-            # z = F.relu(self.fc1(z))
-            # z = self.fc2(z).squeeze()
-            score = torch.sigmoid(z)
+            dis = F.cosine_similarity(z1, z2, dim=1).unsqueeze(-1)
+            dis = 1 - dis  # Convert similarity to a distance measure
+
+        dis = self.drop(dis)
+        score = torch.sigmoid(self.fc(dis).squeeze())
 
         self._loss = self.cost(score, label.float()).mean()
         pred = torch.zeros((score.size(0))).long().cuda()
@@ -61,11 +93,11 @@ class Siamese(nn.Module):
         self._prec = float(np.logical_and(pred == 1, label == 1).sum()) / float((pred == 1).sum() + 1)
         self._recall = float(np.logical_and(pred == 1, label == 1).sum()) / float((label == 1).sum() + 1)
 
-    def encode(self, dataset, batch_size=0): 
+    def encode(self, dataset, batch_size=0):
         self.sentence_encoder.eval()
         with torch.no_grad():
             if self.pre_rep is not None:
-                return self.pre_rep[dataset['id'].view(-1)] 
+                return self.pre_rep[dataset['id'].view(-1)]
 
             if batch_size == 0:
                 x = self.sentence_encoder(dataset)
@@ -96,11 +128,11 @@ class Siamese(nn.Module):
 
         if self.euc:
             dis = torch.pow(x - y, 2)
-            score = torch.sigmoid(self.fc(dis).squeeze(-1)).mean(0)
         else:
-            z = x * y
-            z = self.fc(z).squeeze(-1)
-            score = torch.sigmoid(z).mean(0)
+            dis = F.cosine_similarity(x, y, dim=-1).unsqueeze(-1)
+            dis = 1 - dis
+
+        score = torch.sigmoid(self.fc(dis).squeeze(-1)).mean(0)
 
         pred = torch.zeros((score.size(0))).long().cuda()
         pred[score > threshold] = 1
@@ -118,17 +150,18 @@ class Siamese(nn.Module):
 
         if self.euc:
             dis = torch.pow(x - y, 2)
-            score = torch.sigmoid(self.fc(dis).squeeze(-1)).mean(0)
         else:
-            z = x * y
-            z = self.fc(z).squeeze(-1)
-            score = torch.sigmoid(z).mean(0)
+            dis = F.cosine_similarity(x, y, dim=-1).unsqueeze(-1)
+            dis = 1 - dis
+
+        score = torch.sigmoid(self.fc(dis).squeeze(-1)).mean(0)
 
         pred = []
         for i in range(score.size(0)):
             pred.append((score[i], i))
         pred.sort(key=lambda x: x[0], reverse=True)
         return pred
+
 
 class Snowball(nrekit.framework.Model):
     
@@ -148,6 +181,8 @@ class Snowball(nrekit.framework.Model):
 
         self.pre_rep = pre_rep
         self.neg_loader = neg_loader
+        self.dynamic_threshold = DynamicThreshold()  # Instantiate DynamicThreshold
+
 
     # def __loss__(self, logits, label):
     #     onehot_label = torch.zeros(logits.size()).cuda()
@@ -467,6 +502,8 @@ class Snowball(nrekit.framework.Model):
         for snowball_iter in range(snowball_max_iter):
             if self.args.print_debug:
                 print('###### snowball iter ' + str(snowball_iter))
+            
+            self.dynamic_threshold.decay_thresholds()
             # phase 1: expand positive support set from distant dataset (with same entity pairs)
 
             ## get all entpairs and their ins in positive support set
@@ -510,6 +547,20 @@ class Snowball(nrekit.framework.Model):
       
                 # -- method B: use sort --
                 for i in range(min(len(pick_or_not), sort_num1)):
+                    # Calculate average confidence for this batch
+                    avg_confidence = torch.mean(torch.tensor([x[0] for x in pick_or_not[:sort_num1]])).item()
+                    self.dynamic_threshold.adjust_thresholds(avg_confidence)
+                    dynamic_threshold = self.dynamic_threshold.alpha
+
+                    # Add the average confidence to the history for early stopping
+                    self.dynamic_threshold.confidence_history.append(avg_confidence)
+
+                    # Check for early stopping
+                    if self.dynamic_threshold.check_early_stopping(window_size=5, variance_threshold=0.001):
+                        print("Early stopping triggered.")
+                        break  # Exit the training loop if early stopping condition is met
+
+
                     if pick_or_not[i][0] > sort_threshold1:
                         iid = pick_or_not[i][1]
                         self._add_ins_to_vdata(support_pos, entpair_distant[entpair], iid, label=1)
