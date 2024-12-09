@@ -420,205 +420,152 @@ class Snowball(nrekit.framework.Model):
         x = torch.matmul(x, self.new_W) + self.new_bias # (batch_size, 1)
         x = torch.sigmoid(x)
         return x.view(-1)
-
     def _forward_train(self, support_pos, query, distant, threshold=0.5):
-        '''
-        snowball process (train)
-        support_pos: support set (positive, raw data)
-        support_neg: support set (negative, raw data)
-        query: query set
-        distant: distant data loader
-        threshold: ins with prob > threshold will be classified as positive
-        threshold_for_phase1: distant ins with prob > th_for_phase1 will be added to extended support set at phase1
-        threshold_for_phase2: distant ins with prob > th_for_phase2 will be added to extended support set at phase2
-        '''
+    '''
+    Enhanced Snowball process with top-k approach
+    '''
+    # Existing initialization code remains the same
+    snowball_max_iter = self.args.snowball_max_iter
+    candidate_num_class = 20
+    candidate_num_ins_per_class = 100
 
-        # hyperparameters
-        snowball_max_iter = self.args.snowball_max_iter
-        sys.stdout.flush()
-        candidate_num_class = 20
-        candidate_num_ins_per_class = 100
-        
-        sort_num1 = self.args.phase1_add_num
-        sort_num2 = self.args.phase2_add_num
-        sort_threshold1 = self.args.phase1_siamese_th
-        sort_threshold2 = self.args.phase2_siamese_th
-        sort_ori_threshold = self.args.phase2_cl_th
+    # Top-k related parameters
+    top_k = self.args.top_k  # New parameter to control the number of top similar instances
 
-        # get neg representations with sentence encoder
-        # support_neg_rep = self.encode(support_neg, batch_size=self.args.infer_batch_size)
-        
-        # init
+    # Existing initialization steps
+    self._train_finetune_init()
+    support_pos_rep = self.encode(support_pos, self.args.infer_batch_size)
+    self._train_finetune(support_pos_rep)
+
+    # Track existing instances
+    exist_id = {}
+
+    for snowball_iter in range(snowball_max_iter):
+        # Phase 1: Enhanced Expansion with Top-k Approach
+        # Collect entity pairs from support set
+        entpair_support = {}
+        for i in range(len(support_pos['id'])):
+            entpair = support_pos['entpair'][i]
+            exist_id[support_pos['id'][i]] = 1
+
+            # Initialize entity pair data structure
+            if entpair not in entpair_support:
+                entpair_support[entpair] = {
+                    'word': [],
+                    'mask': [],
+                    'id': [],
+                    'entpair': [],
+                    'pos1': [] if 'pos1' in support_pos else None,
+                    'pos2': [] if 'pos2' in support_pos else None
+                }
+
+            # Add instance to entity pair
+            self._add_ins_to_data(entpair_support[entpair], support_pos, i)
+
+        # Top-k Expansion Process
+        for entpair, support_data in entpair_support.items():
+            # Fetch distant instances with same entity pair
+            distant_data = distant.get_same_entpair_ins(entpair)
+            if distant_data is None:
+                continue
+
+            # Prepare candidate instances
+            candidates = []
+            for i in range(distant_data['word'].size(0)):
+                if distant_data['id'][i] not in exist_id:
+                    candidates.append(i)
+
+            # If no candidates, continue to next entity pair
+            if not candidates:
+                continue
+
+            # Prepare candidate dataset
+            candidate_dataset = {}
+            for key in distant_data:
+                if isinstance(distant_data[key], torch.Tensor):
+                    candidate_dataset[key] = distant_data[key][candidates]
+                else:
+                    candidate_dataset[key] = [distant_data[key][j] for j in candidates]
+
+            # Stack and move to cuda
+            self._dataset_stack_and_cuda(support_data)
+            self._dataset_stack_and_cuda(candidate_dataset)
+
+            # Get top-k similar instances
+            pick_or_not = self.siamese_model.forward_infer_sort(
+                support_data,
+                candidate_dataset,
+                batch_size=self.args.infer_batch_size
+            )
+
+            # Select top-k instances based on similarity
+            added_count = 0
+            for i in range(min(len(pick_or_not), top_k)):
+                if pick_or_not[i][0] > self.args.phase1_siamese_th:
+                    iid = pick_or_not[i][1]
+                    self._add_ins_to_vdata(support_pos, candidate_dataset, iid, label=1)
+                    exist_id[candidate_dataset['id'][iid]] = 1
+                    added_count += 1
+
+            # Update metrics
+            self._phase1_add_num = added_count
+            self._phase1_total = len(candidates)
+
+        # Re-encode support set after expansion
+        support_pos_rep = self.encode(support_pos, batch_size=self.args.infer_batch_size)
+
+        # Fine-tune with new support set
         self._train_finetune_init()
-        # support_rep = self.encode(support, self.args.infer_batch_size)
-        support_pos_rep = self.encode(support_pos, self.args.infer_batch_size)
-        # self._train_finetune(support_rep, support['label'])
         self._train_finetune(support_pos_rep)
 
-        self._metric = []
+        # Phase 2: Random Candidate Selection with Top-k
+        candidate = distant.get_random_candidate(
+            self.pos_class,
+            candidate_num_class,
+            candidate_num_ins_per_class
+        )
 
-        # copy
-        original_support_pos = copy.deepcopy(support_pos)
+        # Classify candidates
+        candidate_prob = self._infer(candidate, batch_size=self.args.infer_batch_size)
 
-        # snowball
-        exist_id = {}
-        if self.args.print_debug:
-            print('\n-------------------------------------------------------')
-        for snowball_iter in range(snowball_max_iter):
-            if self.args.print_debug:
-                print('###### snowball iter ' + str(snowball_iter))
-            # phase 1: expand positive support set from distant dataset (with same entity pairs)
+        # Use Siamese model for similarity
+        pick_or_not = self.siamese_model.forward_infer_sort(
+            support_pos,
+            candidate,
+            batch_size=self.args.infer_batch_size
+        )
 
-            ## get all entpairs and their ins in positive support set
-            old_support_pos_label = support_pos['label'] + 0
-            entpair_support = {}
-            entpair_distant = {}
-            for i in range(len(support_pos['id'])): # only positive support
-                entpair = support_pos['entpair'][i]
-                exist_id[support_pos['id'][i]] = 1
-                if entpair not in entpair_support:
-                    if 'pos1' in support_pos:
-                        entpair_support[entpair] = {'word': [], 'pos1': [], 'pos2': [], 'mask': [], 'id': []}
-                    else:
-                        entpair_support[entpair] = {'word': [], 'mask': [], 'id': []}
-                self._add_ins_to_data(entpair_support[entpair], support_pos, i)
-            
-            ## pick all ins with the same entpairs in distant data and choose with siamese network
-            self._phase1_add_num = 0 # total number of snowball instances
-            self._phase1_total = 0
-            for entpair in entpair_support:
-                raw = distant.get_same_entpair_ins(entpair) # ins with the same entpair
-                if raw is None:
-                    continue
-                if 'pos1' in support_pos:
-                    entpair_distant[entpair] = {'word': [], 'pos1': [], 'pos2': [], 'mask': [], 'id': [], 'entpair': []}
-                else:
-                    entpair_distant[entpair] = {'word': [], 'mask': [], 'id': [], 'entpair': []}
-                for i in range(raw['word'].size(0)):
-                    if raw['id'][i] not in exist_id: # don't pick sentences already in the support set
-                        self._add_ins_to_data(entpair_distant[entpair], raw, i)
-                self._dataset_stack_and_cuda(entpair_support[entpair])
-                self._dataset_stack_and_cuda(entpair_distant[entpair])
-                if len(entpair_support[entpair]['word']) == 0 or len(entpair_distant[entpair]['word']) == 0:
-                    continue
+        # Select top-k instances
+        added_count = 0
+        for i in range(min(len(pick_or_not), top_k)):
+            iid = pick_or_not[i][1]
+            if (pick_or_not[i][0] > self.args.phase2_siamese_th and
+                candidate_prob[iid] > self.args.phase2_cl_th and
+                candidate['id'][iid] not in exist_id):
 
-                
-                pick_or_not = self.siamese_model.forward_infer_sort(entpair_support[entpair], entpair_distant[entpair], batch_size=self.args.infer_batch_size)
-                
-                # pick_or_not = self.siamese_model.forward_infer_sort(original_support_pos, entpair_distant[entpair], threshold=threshold_for_phase1)
-                # pick_or_not = self._infer(entpair_distant[entpair]) > threshold
-      
-                # -- method B: use sort --
-                for i in range(min(len(pick_or_not), sort_num1)):
-                    if pick_or_not[i][0] > sort_threshold1:
-                        iid = pick_or_not[i][1]
-                        self._add_ins_to_vdata(support_pos, entpair_distant[entpair], iid, label=1)
-                        exist_id[entpair_distant[entpair]['id'][iid]] = 1
-                        self._phase1_add_num += 1
-                self._phase1_total += entpair_distant[entpair]['word'].size(0)
-            '''
-            if 'pos1' in support_pos:
-                candidate = {'word': [], 'pos1': [], 'pos2': [], 'mask': [], 'id': [], 'entpair': []}
-            else:
-                candidate = {'word': [], 'mask': [], 'id': [], 'entpair': []}
+                exist_id[candidate['id'][iid]] = 1
+                self._add_ins_to_vdata(support_pos, candidate, iid, label=1)
+                added_count += 1
 
-            self._phase1_add_num = 0 # total number of snowball instances
-            self._phase1_total = 0
-            for entpair in entpair_support:
-                raw = distant.get_same_entpair_ins(entpair) # ins with the same entpair
-                if raw is None:
-                    continue
-                for i in range(raw['word'].size(0)):
-                    if raw['id'][i] not in exist_id: # don't pick sentences already in the support set
-                        self._add_ins_to_data(candidate, raw, i)
+        # Update phase 2 metrics
+        self._phase2_add_num = added_count
+        self._phase2_total = candidate['word'].size(0)
 
-            if len(candidate['word']) > 0:
-                self._dataset_stack_and_cuda(candidate)
-                pick_or_not = self.siamese_model.forward_infer_sort(support_pos, candidate, batch_size=self.args.infer_batch_size)
-                    
-                for i in range(min(len(pick_or_not), sort_num1)):
-                    if pick_or_not[i][0] > sort_threshold1:
-                        iid = pick_or_not[i][1]
-                        self._add_ins_to_vdata(support_pos, candidate, iid, label=1)
-                        exist_id[candidate['id'][iid]] = 1
-                        self._phase1_add_num += 1
-                self._phase1_total += candidate['word'].size(0)
-            '''
-            ## build new support set
-            
-            # print('---')
-            # for i in range(len(support_pos['entpair'])):
-            #     print(support_pos['entpair'][i])
-            # print('---')
-            # print('---')
-            # for i in range(support_pos['id'].size(0)):
-            #     print(support_pos['id'][i])
-            # print('---')
+        # Final evaluation
+        support_pos_rep = self.encode(support_pos, self.args.infer_batch_size)
+        self._train_finetune_init()
+        self._train_finetune(support_pos_rep)
 
-            support_pos_rep = self.encode(support_pos, batch_size=self.args.infer_batch_size)
-            # support_rep = torch.cat([support_pos_rep, support_neg_rep], 0)
-            # support_label = torch.cat([support_pos['label'], support_neg['label']], 0)
-            
-            ## finetune
-            # print("Fine-tune Init")
-            self._train_finetune_init()
-            self._train_finetune(support_pos_rep)
-            if self.args.eval:
-                self._forward_eval_binary(query, threshold)
-            # self._metric.append(np.array([self._f1, self._prec, self._recall]))
-            if self.args.print_debug:
-                print('\nphase1 add {} ins / {}'.format(self._phase1_add_num, self._phase1_total))
+        # Evaluate on query set
+        if self.args.eval:
+            self._forward_eval_binary(query, threshold)
 
-            # phase 2: use the new classifier to pick more extended support ins
-            self._phase2_add_num = 0
-            candidate = distant.get_random_candidate(self.pos_class, candidate_num_class, candidate_num_ins_per_class)
+    # Final evaluation
+    self._forward_eval_binary(query, threshold)
 
-            ## -- method 1: directly use the classifier --
-            candidate_prob = self._infer(candidate, batch_size=self.args.infer_batch_size)
-            ## -- method 2: use siamese network --
+    return support_pos_rep
 
-            pick_or_not = self.siamese_model.forward_infer_sort(support_pos, candidate, batch_size=self.args.infer_batch_size)
 
-            ## -- method A: use threshold --
-            '''
-            self._phase2_total = candidate_prob.size(0)
-            for i in range(candidate_prob.size(0)):
-                # if (candidate_prob[i] > threshold_for_phase2) and not (candidate['id'][i] in exist_id):
-                if (pick_or_not[i]) and (candidate_prob[i] > threshold_for_phase2) and not (candidate['id'][i] in exist_id):
-                    exist_id[candidate['id'][i]] = 1 
-                    self._phase2_add_num += 1
-                    self._add_ins_to_vdata(support_pos, candidate, i, label=1)
-            '''
-
-            ## -- method B: use sort --
-            self._phase2_total = candidate['word'].size(0)
-            for i in range(min(len(candidate_prob), sort_num2)):
-                iid = pick_or_not[i][1]
-                if (pick_or_not[i][0] > sort_threshold2) and (candidate_prob[iid] > sort_ori_threshold) and not (candidate['id'][iid] in exist_id):
-                    exist_id[candidate['id'][iid]] = 1 
-                    self._phase2_add_num += 1
-                    self._add_ins_to_vdata(support_pos, candidate, iid, label=1)
-
-            ## build new support set
-            support_pos_rep = self.encode(support_pos, self.args.infer_batch_size)
-            # support_rep = torch.cat([support_pos_rep, support_neg_rep], 0)
-            # support_label = torch.cat([support_pos['label'], support_neg['label']], 0)
-
-            ## finetune
-            # print("Fine-tune Init")
-            self._train_finetune_init()
-            self._train_finetune(support_pos_rep)
-            if self.args.eval:
-                self._forward_eval_binary(query, threshold)
-                self._metric.append(np.array([self._f1, self._prec, self._recall]))
-                if self.args.print_debug:
-                    print('\nphase2 add {} ins / {}'.format(self._phase2_add_num, self._phase2_total))
-
-        self._forward_eval_binary(query, threshold)
-        if self.args.print_debug:
-            print('\nphase2 add {} ins / {}'.format(self._phase2_add_num, self._phase2_total))
-
-        return support_pos_rep
 
     def _forward_eval_binary(self, query, threshold=0.5):
         '''
